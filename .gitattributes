@@ -1,0 +1,10 @@
+* text=auto
+
+# Python 源码统一 LF
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+pyproject.toml text eol=lf
+
+# Windows 批处理保持 CRLF,双击可正常执行
+*.bat text eol=crlf

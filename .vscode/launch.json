@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "调试 GUI (civitai_gui.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/civitai_gui.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "env": {
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "调试当前打开的 .py 文件",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "env": {
+                "PYTHONIOENCODING": "utf-8"
+            },
+            "justMyCode": true
+        }
+    ]
+}

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+.venv/
+
+# 打包产物 (PyInstaller)
+dist/
+build/
+*.spec
+
+# 运行时配置
+gui_config.json
+
+# 模型数据库缓存(含本地模型文件名,公开仓库不上传;首次运行扫描+联网重建)
+model_db.json
