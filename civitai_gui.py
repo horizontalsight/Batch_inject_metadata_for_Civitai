@@ -19,6 +19,7 @@ Civitai 数据导入助手 — 图形界面 (tkinter / ttk)
 import json
 import os
 import queue
+import re
 import threading
 import webbrowser
 
@@ -40,7 +41,7 @@ APP_VERSION = "0.1.0"
 def load_config():
     if os.path.isfile(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 return data
@@ -152,8 +153,25 @@ class App(tk.Tk):
             if "vista" in style.theme_names():
                 style.theme_use("vista")
             # 列表行高调大,避免中文字体被上下挤压裁切
+            # 卡片头变大
+            style.configure(
+                "TNotebook",
+                tabmargins=(8, 8, 8, 8),
+            )
+            style.configure(
+                "TNotebook.Tab",
+                font=("Microsoft YaHei UI", 12, "bold"),
+                padding=(15, 9),
+            )
             style.configure("Treeview", rowheight=32, font=("Microsoft YaHei UI", 9))
             style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+        except Exception:
+            pass
+
+    def _style_tree(self, tree):
+        """给列表条目加浅灰斑马纹,在视觉上分隔每一条。"""
+        try:
+            tree.tag_configure("alt", background="#f0f0f0")
         except Exception:
             pass
 
@@ -184,6 +202,24 @@ class App(tk.Tk):
         b_refresh = ttk.Button(row2, text="刷新", command=self._global_refresh)
         b_refresh.pack(side="left", padx=(4, 0))
         self._action_buttons.append(b_refresh)
+
+        row3 = ttk.Frame(global_bar)
+        row3.pack(fill="x", pady=(4, 0))
+        ttk.Label(row3, text="筛选栏:").pack(side="left")
+        ttk.Label(row3, text="类型:").pack(side="left", padx=(12, 2))
+        self.type_combo_global = ttk.Combobox(
+            row3, textvariable=self.filter_type, state="readonly", width=14)
+        self.type_combo_global.pack(side="left", padx=(0, 10))
+        self.type_combo_global.bind("<<ComboboxSelected>>", self._on_filter_change)
+        ttk.Label(row3, text="baseModel:").pack(side="left")
+        self.base_combo_global = ttk.Combobox(
+            row3, textvariable=self.filter_base, state="readonly", width=18)
+        self.base_combo_global.pack(side="left", padx=(2, 10))
+        self.base_combo_global.bind("<<ComboboxSelected>>", self._on_filter_change)
+        ttk.Label(row3, text="名称:").pack(side="left")
+        entry_search = ttk.Entry(row3, textvariable=self.filter_search, width=20)
+        entry_search.pack(side="left", padx=(2, 10))
+        entry_search.bind("<KeyRelease>", self._on_filter_change)
 
         nb = ttk.Notebook(main)
         nb.pack(fill="both", expand=True)
@@ -217,33 +253,6 @@ class App(tk.Tk):
         self.cancel_btn = ttk.Button(status_frame, text="取消", command=self._do_cancel, state="disabled")
         self.cancel_btn.pack(side="right")
 
-    def _build_filter_bar(self, parent, with_search=False, count_label_attr=None):
-        """公共筛选行:类型 / baseModel 下拉,可选名称搜索框。"""
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x", pady=(6, 0))
-
-        ttk.Label(bar, text="类型:").pack(side="left")
-        combo_type = ttk.Combobox(bar, textvariable=self.filter_type, state="readonly", width=14)
-        combo_type.pack(side="left", padx=(2, 10))
-        combo_type.bind("<<ComboboxSelected>>", self._on_filter_change)
-
-        ttk.Label(bar, text="baseModel:").pack(side="left")
-        combo_base = ttk.Combobox(bar, textvariable=self.filter_base, state="readonly", width=18)
-        combo_base.pack(side="left", padx=(2, 10))
-        combo_base.bind("<<ComboboxSelected>>", self._on_filter_change)
-
-        if with_search:
-            ttk.Label(bar, text="名称:").pack(side="left")
-            entry = ttk.Entry(bar, textvariable=self.filter_search, width=20)
-            entry.pack(side="left", padx=(2, 10))
-            entry.bind("<KeyRelease>", self._on_filter_change)
-
-        lbl = ttk.Label(bar, text="显示 - / 模型库 -")
-        lbl.pack(side="right")
-        if count_label_attr:
-            setattr(self, count_label_attr, lbl)
-        return combo_type, combo_base
-
     def _build_tab_scan(self):
         f = self.tab_scan
         row0 = ttk.Frame(f)
@@ -256,11 +265,6 @@ class App(tk.Tk):
         bfilter.pack(side="left", padx=(6, 0))
         self._action_buttons += [b, bfilter]
         ttk.Label(row0, text="(留空显示全部,可输入本地绝对路径)").pack(side="left", padx=8)
-
-        # 筛选行:类型 / baseModel
-        ctype, cbase = self._build_filter_bar(f, count_label_attr="_count_label1")
-        self.type_combo1 = ctype
-        self.base_combo1 = cbase
 
         cols = ("web", "file", "autov2", "status", "name", "type", "base")
         tree_frame = ttk.Frame(f)
@@ -358,12 +362,6 @@ class App(tk.Tk):
         ttk.Checkbutton(row2, text="文件名加后缀", variable=self.use_suffix).pack(side="left")
         ttk.Entry(row2, textvariable=self.suffix_var, width=12).pack(side="left", padx=4)
         ttk.Label(row2, text="(默认 _comfy → 生成 xxx_comfy.png)").pack(side="left", padx=4)
-
-        # 筛选行(含名称搜索框)
-        ctype, cbase = self._build_filter_bar(f, with_search=True,
-                                              count_label_attr="_count_label3")
-        self.type_combo3 = ctype
-        self.base_combo3 = cbase
 
         ttk.Label(f, text="勾选要写入的模型(点击最左侧勾选列切换,勾选顺序即写入顺序)。\n"
                           "PNG 写入 prompt/workflow。"
@@ -504,12 +502,12 @@ class App(tk.Tk):
     def _refresh_filter_options(self):
         types = sorted({it["type"] for it in self.pool_items if it["type"]})
         bases = sorted({it["baseModel"] for it in self.pool_items if it["baseModel"]})
-        for combo in (getattr(self, "type_combo1", None), getattr(self, "type_combo3", None)):
+        for combo in (getattr(self, "type_combo_global", None),):
             if combo is not None:
                 combo["values"] = ["全部"] + types
                 if combo.get() not in combo["values"]:
                     combo.set("全部")
-        for combo in (getattr(self, "base_combo1", None), getattr(self, "base_combo3", None)):
+        for combo in (getattr(self, "base_combo_global", None),):
             if combo is not None:
                 combo["values"] = ["全部"] + bases
                 if combo.get() not in combo["values"]:
@@ -622,14 +620,17 @@ class App(tk.Tk):
                                   sort_col=self.sort1_col, sort_rev=self.sort1_rev)
 
     def _visible2(self):
-        """卡片②当前可见的数据库条目列表(按当前排序)。"""
+        """卡片②当前可见的数据库条目列表(按当前排序),支持全局筛选。"""
+        t = self.filter_type.get()
+        b = self.filter_base.get()
+        q = self.filter_search.get().strip().lower()
         items = []
         for av, entry in self.db.items():
             if not isinstance(entry, dict):
                 continue
             files = entry.get("file") or []
             display = files[0] if files else av
-            items.append({
+            it = {
                 "AutoV2": av,
                 "file": display,
                 "files": files,
@@ -639,7 +640,17 @@ class App(tk.Tk):
                 "type": entry.get("type") or "",
                 "baseModel": entry.get("baseModel") or "",
                 "failed": bool(entry.get("failed")),
-            })
+            }
+            if t and t != "全部" and it["type"] != t:
+                continue
+            if b and b != "全部" and it["baseModel"] != b:
+                continue
+            if q:
+                name_hit = q in (it["modelName"] or "").lower()
+                file_hit = any(q in f.lower() for f in files)
+                if not name_hit and not file_hit:
+                    continue
+            items.append(it)
         items.sort(key=lambda it: self._sort_key(it, self.sort2_col), reverse=self.sort2_rev)
         return items
 
@@ -679,7 +690,7 @@ class App(tk.Tk):
             self.tree1.insert("", "end", values=(
                 "🔗", it["file"], it["AutoV2"], status,
                 it["modelName"], it["type"], it["baseModel"],
-            ))
+            ), tags=("alt",) if n % 2 else ())
             n += 1
         self._update_headings(self.tree1, self._cols1, self._heading_text1,
                               self.sort1_col, self.sort1_rev)
@@ -697,7 +708,7 @@ class App(tk.Tk):
             self.tree2.insert("", "end", values=(
                 it["file"], it["AutoV2"], it["modelName"], air_disp,
                 it["type"], it["baseModel"], status, "编辑/删除",
-            ))
+            ), tags=("alt",) if n % 2 else ())
             n += 1
         self._update_headings(self.tree2, self._cols2, self._heading_text2,
                               self.sort2_col, self.sort2_rev)
@@ -720,7 +731,7 @@ class App(tk.Tk):
             self.tree3.insert("", "end", values=(
                 "🔗", check, it["file"], av, air_disp,
                 it["modelName"], it["type"], it["baseModel"],
-            ))
+            ), tags=("alt",) if n % 2 else ())
             n += 1
         self._update_headings(self.tree3, self._cols3, self._heading_text3,
                               self.sort3_col, self.sort3_rev)
@@ -1088,7 +1099,21 @@ class App(tk.Tk):
         saved_dlg_geo = self.cfg.get("edit_dialog_geometry")
         if saved_dlg_geo:
             try:
-                dlg.geometry(saved_dlg_geo)
+                m = re.match(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", saved_dlg_geo)
+                if m:
+                    w = int(m.group(1))
+                    h = int(m.group(2))
+                    x = int(m.group(3))
+                    y = int(m.group(4))
+                    sw = self.winfo_screenwidth()
+                    sh = self.winfo_screenheight()
+                    w = min(w, max(600, sw - 80))
+                    h = min(h, max(500, sh - 120))
+                    x = max(0, min(x, max(0, sw - w - 20)))
+                    y = max(0, min(y, max(0, sh - h - 60)))
+                    dlg.geometry(f"{w}x{h}+{x}+{y}")
+                else:
+                    dlg.geometry(saved_dlg_geo)
             except tk.TclError:
                 pass
         dlg.transient(self)
@@ -1120,7 +1145,6 @@ class App(tk.Tk):
                 row=i, column=1, sticky="w", pady=2)
 
         text = tk.Text(dlg, wrap="none", undo=True)
-        text.pack(fill="both", expand=True, padx=10, pady=4)
         text.insert("1.0", json.dumps(entry, ensure_ascii=False, indent=2))
 
         def remember_dialog_geometry():
@@ -1140,6 +1164,10 @@ class App(tk.Tk):
             if not isinstance(new_entry, dict):
                 messagebox.showerror("错误", "保存内容必须是 JSON 对象。")
                 return
+            ok, errors = core.validate_db_entry(new_entry)
+            if not ok:
+                messagebox.showerror("数据库数据不合法", "\n".join(errors))
+                return
             self.db[av] = new_entry
             db_path = self.db_path.get().strip() or core.default_db_path()
             self.db_path.set(db_path)
@@ -1149,11 +1177,14 @@ class App(tk.Tk):
             remember_dialog_geometry()
             dlg.destroy()
 
-        btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(btn_frame, text="保存", command=save).pack(side="left")
-        ttk.Button(btn_frame, text="取消", command=close_dialog).pack(side="left", padx=8)
+        # 按钮放在文本框上方,确保一定可见
+        btn_frame = ttk.Frame(dlg, padding=(10, 6, 10, 0))
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="保存修改", command=save).pack(side="left")
+        ttk.Button(btn_frame, text="取消修改", command=close_dialog).pack(side="left", padx=8)
         dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        text.pack(fill="both", expand=True, padx=10, pady=4)
 
     def _delete_db_selected(self):
         av = self._selected_db_av()

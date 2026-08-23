@@ -126,6 +126,46 @@ def normalize_db(db):
     return changed
 
 
+def validate_db_entry(entry):
+    """校验单条数据库记录是否合法。
+
+    返回 (is_valid, errors);errors 为字符串列表,为空表示合法。
+    """
+    errors = []
+    if not isinstance(entry, dict):
+        return False, ["条目必须是 JSON 对象"]
+
+    if "file" in entry and not isinstance(entry["file"], list):
+        errors.append("file 必须是数组")
+    else:
+        for i, f in enumerate(entry.get("file", [])):
+            if not isinstance(f, str):
+                errors.append(f"file[{i}] 必须是字符串")
+
+    if "paths" in entry and not isinstance(entry["paths"], list):
+        errors.append("paths 必须是数组")
+    else:
+        for i, p in enumerate(entry.get("paths", [])):
+            if not isinstance(p, str):
+                errors.append(f"paths[{i}] 必须是字符串")
+
+    for key in ("modelName", "AIR", "type", "baseModel", "baseModelType", "error", "url"):
+        if key in entry and entry[key] is not None and not isinstance(entry[key], str):
+            errors.append(f"{key} 必须是字符串或 null")
+
+    for key in ("modelId", "modelVersionId"):
+        if key in entry and entry[key] is not None and not isinstance(entry[key], int):
+            errors.append(f"{key} 必须是整数或 null")
+
+    if "failed" in entry and not isinstance(entry["failed"], bool):
+        errors.append("failed 必须是布尔值")
+
+    if "queriedAt" in entry and entry["queriedAt"] is not None and not isinstance(entry["queriedAt"], str):
+        errors.append("queriedAt 必须是字符串或 null")
+
+    return (len(errors) == 0), errors
+
+
 def load_db(db_path):
     """读取 model_db.json,返回 {AutoV2: entry}。文件不存在/损坏则返回空 dict。
 
@@ -134,7 +174,7 @@ def load_db(db_path):
     if not os.path.isfile(db_path):
         return {}
     try:
-        with open(db_path, "r", encoding="utf-8") as f:
+        with open(db_path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict):
             normalize_db(data)
@@ -164,7 +204,7 @@ def query_by_autov2(autov2):
     成功返回 (entry_dict, None);失败返回 (None, 错误描述)。
     entry_dict 含 AIR / modelName / modelId / modelVersionId / type / baseModel。
     """
-    url = f"https://civitai.com/api/v1/model-versions/by-hash/{autov2}"
+    url = f"https://civitai.red/api/v1/model-versions/by-hash/{autov2}"
     try:
         req = urllib.request.Request(url, headers=_API_HEADERS)
         with urllib.request.urlopen(req, timeout=20) as r:
@@ -185,7 +225,7 @@ def query_by_autov2(autov2):
         "AIR": air,
         "modelId": mid,
         "modelVersionId": vid,
-        "url": f"https://civitai.com/models/{mid}?modelVersionId={vid}" if mid and vid else "",
+        "url": f"https://civitai.red/models/{mid}?modelVersionId={vid}" if mid and vid else "",
         "type": model.get("type"),
         "baseModel": d.get("baseModel"),
         "baseModelType": d.get("baseModelType"),
@@ -208,8 +248,8 @@ def model_url(entry):
         return ""
     vid = entry.get("modelVersionId")
     if vid:
-        return f"https://civitai.com/models/{mid}?modelVersionId={vid}"
-    return f"https://civitai.com/models/{mid}"
+        return f"https://civitai.red/models/{mid}?modelVersionId={vid}"
+    return f"https://civitai.red/models/{mid}"
 
 
 # --------------------------------------------------------------------------
