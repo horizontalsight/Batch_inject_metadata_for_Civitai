@@ -11,8 +11,5 @@ dist/
 build/
 *.spec
 
-# 运行时配置
-gui_config.json
-
-# 模型数据库缓存(含本地模型文件名,公开仓库不上传;首次运行扫描+联网重建)
-model_db.json
+# 本地隐私/运行数据(配置、模型数据库缓存等)
+local_config/
