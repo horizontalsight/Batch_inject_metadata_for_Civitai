@@ -20,7 +20,9 @@ import json
 import os
 import queue
 import re
+import subprocess
 import threading
+import time
 import webbrowser
 
 import tkinter as tk
@@ -29,6 +31,7 @@ from tkinter import ttk, filedialog, messagebox
 import civitai_core as core
 
 CONFIG_PATH = os.path.join(core.local_config_dir(), "gui_config.json")
+LOG_PATH = os.path.join(core.local_config_dir(), "app.log")
 
 # 常用默认路径(仅当对应路径在本机存在时用于预填)
 DEFAULT_MODEL_FOLDER = r"D:\AI tools\ComfyUI-aki-v3\ComfyUI\models"
@@ -80,6 +83,7 @@ class App(tk.Tk):
         self.minsize(940, 680)
 
         self.cfg = load_config()
+        self._reset_detailed_log()
         saved_geo = self.cfg.get("window_geometry")
         if saved_geo:
             try:
@@ -125,6 +129,7 @@ class App(tk.Tk):
         self._build_style()
         self._build_ui()
         self._rebuild_pool()
+        self._startup_self_check()
         self._poll_queue()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -202,6 +207,8 @@ class App(tk.Tk):
         b_refresh = ttk.Button(row2, text="刷新", command=self._global_refresh)
         b_refresh.pack(side="left", padx=(4, 0))
         self._action_buttons.append(b_refresh)
+        ttk.Button(row2, text="打开日志", command=self._open_log_file).pack(
+            side="left", padx=(12, 0))
 
         row3 = ttk.Frame(global_bar)
         row3.pack(fill="x", pady=(4, 0))
@@ -285,6 +292,7 @@ class App(tk.Tk):
         self._cols1 = cols
         self._heading_text1 = {cid: text for cid, text, _w in specs}
         self.tree1.bind("<Button-1>", self._on_tree1_click)
+        self.tree1.bind("<Button-3>", self._on_tree1_context_menu)
 
     def _build_tab_db(self):
         f = self.tab_db
@@ -325,19 +333,24 @@ class App(tk.Tk):
         self.tree2.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tree2.bind("<Button-1>", self._on_tree2_click)
+        self.tree2.bind("<Button-3>", self._on_tree2_context_menu)
         self._cols2 = cols
         self._heading_text2 = {cid: text for cid, text, _w in specs}
 
-        ttk.Label(f, text="说明:「开始扫描模型」按文件名把本地路径保存到数据库,不计算哈希;「更新字段(计算哈希)」负责哈希计算与联网查询。"
+        ttk.Label(f, text="说明:「开始扫描模型」按文件名登记/补录路径;「增量校验(哈希)」只处理待哈希记录;「全量校验(哈希)」重新计算所有记录;「新增联网查询」只查缺失 AIR。"
                           "数据库条目支持选中后编辑/删除。").pack(anchor="w", pady=(6, 2))
 
         btn_frame = ttk.Frame(f)
         btn_frame.pack(anchor="e", pady=(6, 0))
-        b_field = ttk.Button(btn_frame, text="更新字段（计算哈希）", command=self._do_update_fields)
-        b_field.pack(side="left", padx=(0, 6))
+        b_full = ttk.Button(btn_frame, text="全量校验（哈希）", command=self._do_full_hash_verify)
+        b_full.pack(side="left", padx=(0, 6))
+        b_inc = ttk.Button(btn_frame, text="增量校验（哈希）", command=self._do_incremental_hash)
+        b_inc.pack(side="left", padx=(0, 6))
+        b_query = ttk.Button(btn_frame, text="新增联网查询", command=self._do_query_airs)
+        b_query.pack(side="left", padx=(0, 6))
         b_local = ttk.Button(btn_frame, text="更新本地位置", command=self._do_update_local_paths)
         b_local.pack(side="left")
-        self._action_buttons += [b_field, b_local]
+        self._action_buttons += [b_full, b_inc, b_query, b_local]
 
     def _build_tab_inject(self):
         f = self.tab_inject
@@ -392,6 +405,7 @@ class App(tk.Tk):
         self.tree3.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tree3.bind("<Button-1>", self._on_pool_click3)
+        self.tree3.bind("<Button-3>", self._on_tree3_context_menu)
         # 排序:记录列定义(表头点击在 _on_pool_click3 里一并处理)
         self._cols3 = cols
         self._heading_text3 = {cid: text for cid, text, _w in specs}
@@ -416,7 +430,9 @@ class App(tk.Tk):
             seen.add(av)
             files = entry.get("file") or []
             paths = entry.get("paths") or []
-            display = files[0] if files else (os.path.basename(paths[0]) if paths else av)
+            display = (files[0] if files else
+                       (os.path.basename(paths[0]) if paths else
+                        (entry.get("modelName") or av)))
             items.append({
                 "AutoV2": av,
                 "file": display,
@@ -614,10 +630,90 @@ class App(tk.Tk):
                 self._toggle_sort("tab2", col)
                 self._refresh_tab2()
 
+    def _on_tree1_context_menu(self, event):
+        self._show_row_context_menu(event, self.tree1, self._visible1)
+
+    def _on_tree2_context_menu(self, event):
+        self._show_row_context_menu(event, self.tree2, self._visible2)
+
+    def _on_tree3_context_menu(self, event):
+        self._show_row_context_menu(event, self.tree3, self._visible3)
+
+    def _show_row_context_menu(self, event, tree, visible_func):
+        """表格右键菜单:复制名称 / 在文件资源管理器中打开 / 打开网页链接。"""
+        row = tree.identify_row(event.y)
+        if not row:
+            return
+        tree.selection_set(row)
+        idx = tree.index(row)
+        vis = visible_func()
+        if not (0 <= idx < len(vis)):
+            return
+        item = vis[idx]
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="复制名称", command=lambda: self._copy_item_name(item))
+        menu.add_command(label="在文件资源管理器中打开", command=lambda: self._open_in_explorer(item))
+        menu.add_command(label="打开网页链接", command=lambda: self._open_model_web(item))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_item_name(self, item):
+        name = item.get("modelName") or item.get("file") or item.get("AutoV2") or ""
+        self.clipboard_clear()
+        self.clipboard_append(name)
+        self.update_idletasks()
+        self._append_log(f"[复制] {name}")
+
+    def _open_in_explorer(self, item):
+        paths = item.get("paths") or []
+        if not paths:
+            entry = self.db.get(item["AutoV2"])
+            if entry:
+                paths = entry.get("paths") or []
+
+        for p in paths:
+            if not p:
+                continue
+            # 兼容正斜杠 / 反斜杠、重复分隔符等路径写法
+            candidates = [p]
+            norm = os.path.normpath(p)
+            if norm != p:
+                candidates.append(norm)
+            norm_win = norm.replace("/", "\\")
+            if norm_win not in candidates:
+                candidates.append(norm_win)
+
+            for cand in candidates:
+                if os.path.exists(cand):
+                    folder = os.path.dirname(cand)
+                    try:
+                        if os.name == "nt":
+                            os.startfile(folder)
+                        else:
+                            subprocess.Popen(["xdg-open", folder])
+                        return
+                    except Exception as e:
+                        messagebox.showerror(
+                            "错误",
+                            f"无法打开文件夹:\n{folder}\n\n详细错误:\n{e}"
+                        )
+                        return
+
+        messagebox.showinfo(
+            "提示",
+            "该记录没有可用的本地路径，或路径不存在。\n"
+            "请检查 local_config/model_db.json 中该记录的 paths 字段。"
+        )
+
     def _visible1(self):
-        """卡片①当前筛选后的可见模型列表(按当前排序)。"""
-        return self._visible_pool(path_filter=self.query_path.get(),
-                                  sort_col=self.sort1_col, sort_rev=self.sort1_rev)
+        """卡片①当前筛选后的可见模型列表(按当前排序),支持全局筛选。"""
+        return self._visible_pool(
+            path_filter=self.query_path.get(),
+            search=self.filter_search.get(),
+            sort_col=self.sort1_col, sort_rev=self.sort1_rev,
+        )
 
     def _visible2(self):
         """卡片②当前可见的数据库条目列表(按当前排序),支持全局筛选。"""
@@ -629,7 +725,10 @@ class App(tk.Tk):
             if not isinstance(entry, dict):
                 continue
             files = entry.get("file") or []
-            display = files[0] if files else av
+            paths = entry.get("paths") or []
+            display = (files[0] if files else
+                       (os.path.basename(paths[0]) if paths else
+                        (entry.get("modelName") or av)))
             it = {
                 "AutoV2": av,
                 "file": display,
@@ -667,9 +766,12 @@ class App(tk.Tk):
             messagebox.showerror("错误", f"打开网页失败: {e}")
 
     def _item_status(self, it):
-        if it["AutoV2"] not in self.db:
+        av = it["AutoV2"]
+        if core.is_pending_key(av):
+            return "待哈希"
+        if av not in self.db:
             return "未收录"
-        entry = self.db[it["AutoV2"]]
+        entry = self.db[av]
         if entry.get("failed"):
             return "查询失败"
         if entry.get("AIR"):
@@ -687,8 +789,9 @@ class App(tk.Tk):
         n = 0
         for it in self._visible1():
             status = self._item_status(it)
+            av_disp = "待哈希" if core.is_pending_key(it["AutoV2"]) else it["AutoV2"]
             self.tree1.insert("", "end", values=(
-                "🔗", it["file"], it["AutoV2"], status,
+                "🔗", it["file"], av_disp, status,
                 it["modelName"], it["type"], it["baseModel"],
             ), tags=("alt",) if n % 2 else ())
             n += 1
@@ -703,10 +806,11 @@ class App(tk.Tk):
         n = 0
         for it in self._visible2():
             status = self._item_status(it)
+            av_disp = "待哈希" if core.is_pending_key(it["AutoV2"]) else it["AutoV2"]
             air = it["AIR"]
             air_disp = (air[:20] + "…") if len(air) > 20 else air
             self.tree2.insert("", "end", values=(
-                it["file"], it["AutoV2"], it["modelName"], air_disp,
+                it["file"], av_disp, it["modelName"], air_disp,
                 it["type"], it["baseModel"], status, "编辑/删除",
             ), tags=("alt",) if n % 2 else ())
             n += 1
@@ -726,10 +830,11 @@ class App(tk.Tk):
                 check = f"☑ {order}"
             else:
                 check = "☐"
+            av_disp = "待哈希" if core.is_pending_key(av) else av
             air = it["AIR"]
             air_disp = (air[:20] + "…") if len(air) > 20 else air
             self.tree3.insert("", "end", values=(
-                "🔗", check, it["file"], av, air_disp,
+                "🔗", check, it["file"], av_disp, air_disp,
                 it["modelName"], it["type"], it["baseModel"],
             ), tags=("alt",) if n % 2 else ())
             n += 1
@@ -813,9 +918,51 @@ class App(tk.Tk):
             pass
         self.after(60, self._poll_queue)
 
+    def _reset_detailed_log(self):
+        """每次启动时重置详细日志文件。"""
+        try:
+            with open(LOG_PATH, "w", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动日志已重置\n")
+        except Exception:
+            pass
+
+    def _write_detailed_log(self, msg):
+        """把详细日志写入 local_config/app.log。"""
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
+    def _is_ui_summary(self, msg):
+        """判断一条日志是否需要在 UI 中显示一句话概括。"""
+        keywords = ("完成", "启动自检", "[操作]", "[错误]", "[警告]", "[刷新]", "[异常]")
+        return any(k in msg for k in keywords)
+
     def _append_log(self, msg):
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
+        # 所有日志都写入详细文件
+        self._write_detailed_log(msg)
+        # UI 只显示一句话概括
+        if self._is_ui_summary(msg):
+            self.log_text.insert("end", msg + "\n")
+            self.log_text.see("end")
+
+    def _startup_self_check(self):
+        """启动自检:检查数据库完整性,详细写入日志,UI 只显示汇总。"""
+        issues = core.check_db_integrity(self.db)
+        if not issues:
+            self._write_detailed_log("[自检] 数据库完整性检查通过,未发现异常。")
+            self._append_log("[自检] 启动自检完成:数据库正常")
+            return
+        for issue in issues:
+            self._write_detailed_log(
+                f"[自检][WARN] 记录 {issue['key']} ({issue['name']}) "
+                f"{issue['issue']};建议:{issue['suggestion']}"
+            )
+        self._append_log(
+            f"[自检] 启动自检完成:发现 {len(issues)} 条不完整数据,"
+            f"详见 local_config/app.log"
+        )
 
     def _progress_cb(self, i, total):
         self.task_queue.put(("progress", i, total))
@@ -923,6 +1070,13 @@ class App(tk.Tk):
             self.cfg["comfyui_model_path"] = d
             save_config(self.cfg)
 
+    def _open_log_file(self):
+        """打开详细日志文件 local_config/app.log。"""
+        try:
+            os.startfile(LOG_PATH)
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开日志文件:\n{e}")
+
     def _global_refresh(self):
         """刷新数据库,并重置排序/筛选/勾选状态,尽量恢复成刚打开程序的样子。"""
         self.db = core.load_db(self.db_path.get())
@@ -949,11 +1103,10 @@ class App(tk.Tk):
             return
         db_path = self.db_path.get().strip() or core.default_db_path()
         self.db_path.set(db_path)
-        self._append_log(f"[操作] 开始扫描模型文件夹(按文件名保存,不计算哈希): {folder}")
+        self._append_log(f"[操作] 开始扫描模型文件夹(按文件名登记,不计算哈希): {folder}")
 
         def target():
-            # 不计算哈希,只按文件名匹配数据库记录并写入本地绝对路径。
-            return core.update_local_paths_by_folder(
+            return core.scan_and_register_folder(
                 folder, db_path=db_path,
                 log=self._append_log, cancel=self._cancel,
                 progress=self._progress_cb,
@@ -963,102 +1116,98 @@ class App(tk.Tk):
             if db is None:
                 return
             self.db = db
-            self.models = []  # 扫描不再产生哈希结果,哈希交给「更新字段(计算哈希)」
+            self.models = []
             self.cfg["model_folder"] = folder
             self.cfg["db_path"] = db_path
             save_config(self.cfg)
             self._rebuild_pool()
-            self.status_var.set("扫描完成:已按文件名保存本地路径")
+            self.status_var.set("扫描完成:已按文件名登记本地模型")
 
         self._run_task(target, on_done)
 
     # ------------------------------------------------------------------
     # ② 更新数据库
     # ------------------------------------------------------------------
-    def _update_db_models(self):
-        """构造传给 core.update_db 的模型清单。
-
-        只包含两类:本次扫描到的(可能要新查询)、数据库里之前失败的(重试)。
-        不传已成功的数据库记录;文件名为空时用 AutoV2 占位的情况也排除,
-        避免把 AutoV2 当文件名写进数据库。
-        """
-        items = []
-        seen = set()
-        for m in self.models:
-            if m["AutoV2"] not in seen:
-                items.append({
-                    "AutoV2": m["AutoV2"],
-                    "file": m["file"],
-                    "path": m.get("path", ""),
-                })
-                seen.add(m["AutoV2"])
-        for av, entry in self.db.items():
-            if av in seen or not isinstance(entry, dict):
-                continue
-            if entry.get("failed"):
-                files = [f for f in (entry.get("file") or []) if f]
-                paths = [p for p in (entry.get("paths") or []) if p]
-                if files:
-                    items.append({
-                        "AutoV2": av,
-                        "file": files[0],
-                        "path": paths[0] if paths else "",
-                    })
-                    seen.add(av)
-        return items
-
-    def _do_update_fields(self):
-        """更新字段:继承原「更新数据库」逻辑,先按顶部模型路径计算哈希,再联网查询缺失/失败记录。"""
-        if not self.pool_items:
-            messagebox.showwarning("提示", "模型库为空。请先在 ② 扫描模型路径,或先加载数据库。")
-            return
+    def _do_full_hash_verify(self):
+        """全量校验(哈希):重新计算所有有 paths 的记录,并校验主键是否一致。"""
         db_path = self.db_path.get().strip() or core.default_db_path()
         self.db_path.set(db_path)
 
         def target():
-            # 如果没有扫描结果,先按顶部“模型路径”计算哈希,保持原有更新数据库行为。
-            if not self.models:
-                folder = self.model_folder.get().strip()
-                if folder and os.path.isdir(folder):
-                    self._append_log(f"[字段更新] 未检测到扫描结果,先扫描模型路径: {folder}")
-                    self.models = core.scan_models(
-                        folder, recursive=True,
-                        log=self._append_log, cancel=self._cancel,
-                        progress=self._progress_cb,
-                    )
-            models = self._update_db_models()
-            if not models:
-                self._append_log("[字段更新] 没有需要更新字段的模型记录。")
-                return None
-            return core.update_db(models, db_path=db_path,
-                                  log=self._append_log, cancel=self._cancel,
-                                  progress=self._progress_cb)
+            return core.compute_hashes_from_db(
+                db_path=db_path, full=True,
+                log=self._append_log, cancel=self._cancel,
+                progress=self._progress_cb,
+            )
 
         def on_done(db):
             if db is None:
-                self.status_var.set("字段更新:无记录可处理")
+                self.status_var.set("全量校验:未执行")
                 return
             self.db = db
             self.cfg["db_path"] = db_path
             save_config(self.cfg)
             self._rebuild_pool()
-            self.status_var.set("字段更新完成")
+            self.status_var.set("全量校验完成")
 
         self._run_task(target, on_done)
 
-    def _do_update_local_paths(self):
-        """更新本地位置:扫描模型路径并把本地文件名/绝对路径写入数据库,不联网。"""
+    def _do_incremental_hash(self):
+        """增量校验(哈希):只处理 pending 临时记录,已哈希的记录跳过。"""
         db_path = self.db_path.get().strip() or core.default_db_path()
         self.db_path.set(db_path)
 
         def target():
-            folder = self.model_folder.get().strip()
-            if not folder or not os.path.isdir(folder):
-                self._append_log("[本地位置] 请先填写有效的模型路径。")
-                return None
-            # 不计算哈希:只按文件名匹配数据库已有记录,并补充本地绝对路径。
-            return core.update_local_paths_by_folder(
-                folder, db_path=db_path,
+            return core.compute_hashes_from_db(
+                db_path=db_path, full=False,
+                log=self._append_log, cancel=self._cancel,
+                progress=self._progress_cb,
+            )
+
+        def on_done(db):
+            if db is None:
+                self.status_var.set("增量校验:未执行")
+                return
+            self.db = db
+            self.cfg["db_path"] = db_path
+            save_config(self.cfg)
+            self._rebuild_pool()
+            self.status_var.set("增量校验完成")
+
+        self._run_task(target, on_done)
+
+    def _do_query_airs(self):
+        """新增联网查询:遍历数据库,找到有 AutoV2 但没有 AIR 的记录联网查询。"""
+        db_path = self.db_path.get().strip() or core.default_db_path()
+        self.db_path.set(db_path)
+
+        def target():
+            return core.query_missing_airs(
+                db_path=db_path,
+                log=self._append_log, cancel=self._cancel,
+                progress=self._progress_cb,
+            )
+
+        def on_done(db):
+            if db is None:
+                self.status_var.set("联网查询:未执行")
+                return
+            self.db = db
+            self.cfg["db_path"] = db_path
+            save_config(self.cfg)
+            self._rebuild_pool()
+            self.status_var.set("联网查询完成")
+
+        self._run_task(target, on_done)
+
+    def _do_update_local_paths(self):
+        """更新本地位置:从数据库遍历已有 paths,校验路径/文件名,不读取文本框。"""
+        db_path = self.db_path.get().strip() or core.default_db_path()
+        self.db_path.set(db_path)
+
+        def target():
+            return core.verify_local_paths(
+                db_path=db_path,
                 log=self._append_log, cancel=self._cancel,
                 progress=self._progress_cb,
             )

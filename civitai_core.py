@@ -56,6 +56,23 @@ def default_db_path():
     return os.path.join(local_config_dir(), "model_db.json")
 
 
+def normalize_windows_path(path):
+    """统一为 Windows 反斜杠格式,例如 D:\\models\\foo.safetensors。"""
+    if not path:
+        return path
+    return os.path.normpath(path).replace("/", "\\")
+
+
+def is_pending_key(key):
+    """判断是否为尚未计算哈希的临时记录 key。"""
+    return isinstance(key, str) and key.startswith("pending:")
+
+
+def pending_key_for_path(path):
+    """为尚未计算哈希的本地文件生成临时 key。"""
+    return "pending:" + normalize_windows_path(path)
+
+
 # --------------------------------------------------------------------------
 # 哈希计算
 # --------------------------------------------------------------------------
@@ -98,6 +115,29 @@ DB_FIELD_DEFAULTS = {
 }
 
 
+def _unique_file_name(db, target_av, base_name):
+    """生成不与其它记录重复的 file 名称。
+
+    如果其它 AutoV2 记录已经使用了同一个文件名,则自动加上后缀,
+    例如: foo.safetensors -> foo (2).safetensors。
+    """
+    stem, ext = os.path.splitext(base_name)
+    candidate = base_name
+    n = 2
+    while True:
+        duplicated = False
+        for av, entry in db.items():
+            if av == target_av or not isinstance(entry, dict):
+                continue
+            if candidate in (entry.get("file") or []):
+                duplicated = True
+                break
+        if not duplicated:
+            return candidate
+        candidate = f"{stem} ({n}){ext}"
+        n += 1
+
+
 def normalize_db(db):
     """按 DB_FIELD_DEFAULTS 规范数据库条目,补齐缺失字段。
 
@@ -106,7 +146,7 @@ def normalize_db(db):
     if not isinstance(db, dict):
         return False
     changed = False
-    for entry in db.values():
+    for av, entry in db.items():
         if not isinstance(entry, dict):
             continue
         for key, default in DB_FIELD_DEFAULTS.items():
@@ -123,6 +163,16 @@ def normalize_db(db):
         if not isinstance(entry.get("failed"), bool):
             entry["failed"] = bool(entry.get("failed"))
             changed = True
+        # 如果 file 为空但 paths 里有本地路径,则用路径中的文件名回填 file
+        if not entry["file"] and entry["paths"]:
+            for p in entry["paths"]:
+                if p:
+                    name = os.path.basename(p.rstrip("\\/"))
+                    if name:
+                        unique_name = _unique_file_name(db, av, name)
+                        if unique_name not in entry["file"]:
+                            entry["file"].append(unique_name)
+                            changed = True
     return changed
 
 
@@ -164,6 +214,84 @@ def validate_db_entry(entry):
         errors.append("queriedAt 必须是字符串或 null")
 
     return (len(errors) == 0), errors
+
+
+def check_db_integrity(db):
+    """启动自检:检查数据库记录的完整性。
+
+    返回 issue 列表,每个 issue 含 key/name/issue/suggestion。
+    """
+    issues = []
+    if not isinstance(db, dict):
+        return [{
+            "key": "-",
+            "name": "-",
+            "issue": "数据库不是有效的 JSON 对象",
+            "suggestion": "请删除 local_config/model_db.json 后重新扫描",
+        }]
+
+    for av, entry in db.items():
+        if not isinstance(entry, dict):
+            issues.append({
+                "key": av,
+                "name": "",
+                "issue": "记录不是 JSON 对象",
+                "suggestion": "请删除或修复该记录",
+            })
+            continue
+
+        name = entry.get("modelName") or av
+
+        if not entry.get("paths"):
+            issues.append({
+                "key": av,
+                "name": name,
+                "issue": "缺少本地路径 paths",
+                "suggestion": "运行「开始扫描模型」补充路径,或删除该旧记录",
+            })
+
+        if not entry.get("file"):
+            issues.append({
+                "key": av,
+                "name": name,
+                "issue": "缺少本地文件名 file",
+                "suggestion": "运行「开始扫描模型」或「更新字段(计算哈希)」补充",
+            })
+
+        for p in entry.get("paths") or []:
+            if p and not os.path.exists(p):
+                issues.append({
+                    "key": av,
+                    "name": name,
+                    "issue": f"路径不存在: {p}",
+                    "suggestion": "请检查文件是否被移动或删除",
+                })
+            if p and entry.get("file") and os.path.basename(p) not in entry["file"]:
+                issues.append({
+                    "key": av,
+                    "name": name,
+                    "issue": f"file 与路径文件名不一致: {p}",
+                    "suggestion": "请手动检查或编辑该记录",
+                })
+
+    # 重名文件检查
+    name_map = {}
+    for av, entry in db.items():
+        if not isinstance(entry, dict):
+            continue
+        for f in (entry.get("file") or []):
+            if f:
+                name_map.setdefault(os.path.basename(f).lower(), []).append(av)
+    for name, avs in name_map.items():
+        if len(avs) > 1:
+            issues.append({
+                "key": ",".join(avs),
+                "name": name,
+                "issue": f"多个记录使用相同文件名: {name}",
+                "suggestion": "请手动检查是否为同一模型,必要时删除多余记录",
+            })
+
+    return issues
 
 
 def load_db(db_path):
@@ -433,10 +561,46 @@ def update_db(models, db_path=None, log=None, cancel=None, progress=None):
 
     # 只关心需要联网查询的 AutoV2 列表
     avs = []
+    av_files = {}
+    av_paths = {}
     for m in models:
         av = m.get("AutoV2")
-        if av and av not in avs:
-            avs.append(av)
+        f = m.get("file")
+        p = m.get("path")
+        if av:
+            if av not in avs:
+                avs.append(av)
+            if f:
+                av_files.setdefault(av, []).append(f)
+            if p:
+                av_paths.setdefault(av, []).append(p)
+
+    # 即使已成功收录的记录,也尽量把本地扫描到的文件名/路径回填进数据库
+    file_added = 0
+    for av, files in av_files.items():
+        if av in db:
+            entry = db[av]
+            if not isinstance(entry.get("file"), list):
+                entry["file"] = []
+            for f in files:
+                if f and f not in entry["file"]:
+                    entry["file"].append(_unique_file_name(db, av, f))
+                    file_added += 1
+    if file_added:
+        _log(log, f"[字段更新] 已补充 {file_added} 个本地文件名。")
+
+    path_added = 0
+    for av, paths in av_paths.items():
+        if av in db:
+            entry = db[av]
+            if not isinstance(entry.get("paths"), list):
+                entry["paths"] = []
+            for p in paths:
+                if p and p not in entry["paths"]:
+                    entry["paths"].append(p)
+                    path_added += 1
+    if path_added:
+        _log(log, f"[字段更新] 已补充 {path_added} 个本地绝对路径。")
 
     need = [av for av in avs if av not in db or db[av].get("failed")]
     _log(log, f"[字段更新] 当前 {len(db)} 条记录,本次需联网查询 {len(need)} 个模型。")
@@ -449,12 +613,23 @@ def update_db(models, db_path=None, log=None, cancel=None, progress=None):
             _log(log, "[字段更新] 已取消,保存当前进度。")
             break
         old = db.get(av)
+        old_file = (old.get("file") or []) if old else []
+        old_paths = (old.get("paths") or []) if old else []
+        new_file = list(old_file)
+        for f in av_files.get(av, []):
+            if f and f not in new_file:
+                new_file.append(_unique_file_name(db, av, f))
+        new_paths = list(old_paths)
+        for p in av_paths.get(av, []):
+            if p and p not in new_paths:
+                new_paths.append(p)
+
         entry, err = query_by_autov2(av)
         if entry is None:
             fail += 1
             db[av] = {
-                "file": (old.get("file") or []) if old else [],
-                "paths": (old.get("paths") or []) if old else [],
+                "file": new_file,
+                "paths": new_paths,
                 "modelName": "",
                 "AIR": None,
                 "modelId": None,
@@ -471,8 +646,8 @@ def update_db(models, db_path=None, log=None, cancel=None, progress=None):
         else:
             ok += 1
             # 保留已有本地信息,避免字段更新覆盖本地路径/文件名
-            entry["file"] = (old.get("file") or []) if old else []
-            entry["paths"] = (old.get("paths") or []) if old else []
+            entry["file"] = new_file
+            entry["paths"] = new_paths
             entry["queriedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
             db[av] = entry
             _log(log, f"    [{i}/{total}] OK {av}  {entry['modelName']}")
@@ -537,7 +712,7 @@ def update_local_paths(models, db_path=None, log=None, cancel=None, progress=Non
             entry["paths"] = []
         for f in av_files[av]:
             if f and f not in entry["file"]:
-                entry["file"].append(f)
+                entry["file"].append(_unique_file_name(db, av, f))
                 added_files += 1
         for p in av_paths.get(av, []):
             if p not in entry["paths"]:
@@ -560,7 +735,7 @@ def update_local_paths_by_folder(folder, db_path=None, log=None, cancel=None, pr
     """更新本地位置(不计算哈希)。
 
     根据顶部“模型路径”枚举模型文件,再按数据库已有 `file` 文件名做匹配,
-    把匹配到的本地绝对路径写入对应记录的 `paths` 字段。
+    把匹配到的本地绝对路径写入对应记录的 `paths` 字段,并尽量回填 `file`。
     不会联网,也不会计算 SHA256/AutoV2。
     """
     db_path = db_path or default_db_path()
@@ -572,43 +747,381 @@ def update_local_paths_by_folder(folder, db_path=None, log=None, cancel=None, pr
         _log(log, "[本地位置] 路径下没有模型文件。")
         return db
 
+    # 已有绝对路径 → AutoV2,用于跳过已记录路径
+    path_to_av = {}
     # 文件名(小写) → AutoV2 列表
     by_name = {}
     for av, entry in db.items():
         if not isinstance(entry, dict):
             continue
+        for p in (entry.get("paths") or []):
+            if p:
+                path_to_av.setdefault(os.path.normcase(os.path.normpath(p)), av)
         for f in (entry.get("file") or []):
             if f:
                 by_name.setdefault(os.path.basename(f).lower(), []).append(av)
 
-    added = 0
+    added_paths = 0
+    added_files = 0
     matched = 0
+    ambiguous = 0
     for p in files:
         if cancel and cancel.is_set():
             _log(log, "[本地位置] 已取消。")
             break
+        norm_p = os.path.normcase(os.path.normpath(p))
+        if norm_p in path_to_av:
+            continue
+
         base = os.path.basename(p).lower()
         avs = by_name.get(base, [])
         if not avs:
             continue
         matched += 1
-        for av in avs:
-            entry = db[av]
-            if not isinstance(entry.get("paths"), list):
-                entry["paths"] = []
-            if p not in entry["paths"]:
-                entry["paths"].append(p)
-                added += 1
+
+        # 精确匹配:只有一个候选
+        target_av = None
+        if len(avs) == 1:
+            target_av = avs[0]
+        else:
+            # 多个候选时,尝试用目录来区分
+            current_dir = os.path.dirname(norm_p)
+            dir_hits = []
+            for av in avs:
+                entry = db[av]
+                for old_p in (entry.get("paths") or []):
+                    if old_p and os.path.dirname(os.path.normcase(os.path.normpath(old_p))) == current_dir:
+                        dir_hits.append(av)
+                        break
+            if len(dir_hits) == 1:
+                target_av = dir_hits[0]
+            else:
+                ambiguous += 1
+                _log(log, f"[本地位置] 跳过重名文件(无法确定归属): {p}")
+                continue
+
+        entry = db[target_av]
+        if not isinstance(entry.get("paths"), list):
+            entry["paths"] = []
+        if p not in entry["paths"]:
+            entry["paths"].append(p)
+            added_paths += 1
+
+        if not isinstance(entry.get("file"), list):
+            entry["file"] = []
+        real_name = os.path.basename(p)
+        if real_name not in entry["file"]:
+            entry["file"].append(_unique_file_name(db, target_av, real_name))
+            added_files += 1
 
     if matched:
         _log(log, f"[本地位置] 路径下匹配到 {matched} 个模型文件(按文件名匹配,未计算哈希)。")
-    if added:
-        _log(log, f"[本地位置] 已补充 {added} 个本地绝对路径。")
-    else:
+    if ambiguous:
+        _log(log, f"[本地位置] 有 {ambiguous} 个重名文件因无法确定归属已跳过。")
+    if added_paths:
+        _log(log, f"[本地位置] 已补充 {added_paths} 个本地绝对路径。")
+    if added_files:
+        _log(log, f"[本地位置] 已补充 {added_files} 个本地文件名。")
+    if not added_paths and not added_files:
         _log(log, "[本地位置] 没有需要新增的本地绝对路径。")
 
     save_db(db, db_path)
     _log(log, f"[本地位置] 完成,当前数据库 {len(db)} 条记录。")
+    return db
+
+
+# --------------------------------------------------------------------------
+# 四键新逻辑:开始扫描 / 更新本地位置 / 计算哈希 / 联网查询
+# --------------------------------------------------------------------------
+def scan_and_register_folder(folder, db_path=None, log=None, cancel=None, progress=None):
+    """开始扫描模型:根据本地路径枚举文件,按文件名登记/补录,不计算哈希。
+
+    - 已有记录:补路径;路径冲突则报错。
+    - 没有记录:创建 pending 临时记录。
+    """
+    db_path = db_path or default_db_path()
+    db = load_db(db_path)
+    normalize_db(db)
+
+    files = find_model_files(folder, recursive=True)
+    if not files:
+        _log(log, "[扫描] 路径下没有模型文件。")
+        return db
+
+    path_to_av = {}
+    name_to_av = {}
+    for av, entry in db.items():
+        if not isinstance(entry, dict):
+            continue
+        for p in (entry.get("paths") or []):
+            if p:
+                norm = normalize_windows_path(p).lower()
+                path_to_av.setdefault(norm, av)
+                name_to_av.setdefault(os.path.basename(p).lower(), []).append(av)
+        for f in (entry.get("file") or []):
+            if f:
+                name_to_av.setdefault(os.path.basename(f).lower(), []).append(av)
+
+    created = 0
+    filled = 0
+    errors = 0
+    total = len(files)
+    for i, p in enumerate(files, 1):
+        if cancel and cancel.is_set():
+            _log(log, "[扫描] 已取消。")
+            break
+        norm_p = normalize_windows_path(p)
+        norm_key = norm_p.lower()
+        if norm_key in path_to_av:
+            continue
+
+        base = os.path.basename(p).lower()
+        candidates = []
+        for av in name_to_av.get(base, []):
+            if av not in candidates:
+                candidates.append(av)
+
+        if not candidates:
+            av = pending_key_for_path(p)
+            db[av] = {
+                "file": [os.path.basename(p)],
+                "paths": [norm_p],
+                "modelName": "",
+                "AIR": None,
+                "modelId": None,
+                "modelVersionId": None,
+                "url": None,
+                "type": None,
+                "baseModel": None,
+                "baseModelType": None,
+                "queriedAt": None,
+                "failed": False,
+                "error": None,
+            }
+            created += 1
+            _log(log, f"[扫描] 新建待哈希记录: {norm_p}")
+            continue
+
+        if len(candidates) == 1:
+            av = candidates[0]
+            entry = db[av]
+            if not isinstance(entry.get("paths"), list):
+                entry["paths"] = []
+            if not entry["paths"]:
+                entry["paths"].append(norm_p)
+                if not isinstance(entry.get("file"), list):
+                    entry["file"] = []
+                real_name = os.path.basename(p)
+                if real_name not in entry["file"]:
+                    entry["file"].append(_unique_file_name(db, av, real_name))
+                filled += 1
+                _log(log, f"[扫描] 已补路径: {norm_p}")
+            else:
+                if norm_p not in entry["paths"]:
+                    errors += 1
+                    _log(log, f"[扫描] 错误:同名文件但路径不同,已跳过: {norm_p}")
+                else:
+                    _log(log, f"[扫描] 路径已存在: {norm_p}")
+            continue
+
+        errors += 1
+        _log(log, f"[扫描] 错误:多个记录使用同名文件,无法确定归属: {norm_p}")
+
+        if progress:
+            progress(i, total)
+
+    save_db(db, db_path)
+    _log(log, f"[扫描] 完成:新建 {created} 条,补路径 {filled} 条,错误 {errors} 条。")
+    return db
+
+
+def verify_local_paths(db_path=None, log=None, cancel=None, progress=None):
+    """更新本地位置:从数据库遍历已有 paths,校验文件是否存在、文件名是否匹配。"""
+    db_path = db_path or default_db_path()
+    db = load_db(db_path)
+    normalize_db(db)
+
+    changed = False
+    errors = 0
+    filled_files = 0
+    db_items = list(db.items())
+    total = len(db_items)
+    for i, (av, entry) in enumerate(db_items, 1):
+        if cancel and cancel.is_set():
+            _log(log, "[本地位置] 已取消。")
+            break
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("paths"):
+            errors += 1
+            _log(log, f"[本地位置] 错误:记录 {av} ({entry.get('modelName') or ''}) 没有本地路径,请删除或重建。")
+        else:
+            for p in entry.get("paths") or []:
+                if not p:
+                    continue
+                if not os.path.exists(p):
+                    errors += 1
+                    _log(log, f"[本地位置] 错误:路径不存在: {p}")
+                    continue
+                real_name = os.path.basename(p)
+                if not isinstance(entry.get("file"), list):
+                    entry["file"] = []
+                if not entry["file"]:
+                    entry["file"].append(real_name)
+                    filled_files += 1
+                    changed = True
+                elif real_name not in entry["file"]:
+                    errors += 1
+                    _log(log, f"[本地位置] 错误:记录 {av} 的 file 与路径文件名不一致: {p}")
+        if progress:
+            progress(i, total)
+
+    if changed:
+        save_db(db, db_path)
+    _log(log, f"[本地位置] 完成:校验 {len(db)} 条记录,错误 {errors} 条,补文件名 {filled_files} 条。")
+    return db
+
+
+def compute_hashes_from_db(db_path=None, log=None, cancel=None, progress=None, full=True):
+    """计算/校验哈希。
+
+    full=True: 全量校验,遍历所有有 paths 的记录并重新计算哈希。
+    full=False: 增量校验,只处理 pending 临时记录。
+    """
+    db_path = db_path or default_db_path()
+    db = load_db(db_path)
+    normalize_db(db)
+
+    changed = False
+    errors = 0
+    hashed = 0
+    keys = list(db.keys())
+    total = len(keys)
+    mode = "全量" if full else "增量"
+    for i, av in enumerate(keys, 1):
+        if cancel and cancel.is_set():
+            _log(log, f"[哈希] 已取消。")
+            break
+        if not full and not is_pending_key(av):
+            continue
+        entry = db[av]
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("paths"):
+            errors += 1
+            _log(log, f"[哈希] 错误:记录 {av} ({entry.get('modelName') or ''}) 没有本地路径,无法计算哈希。")
+            continue
+
+        hashes = []
+        for p in entry.get("paths") or []:
+            if not os.path.exists(p):
+                errors += 1
+                _log(log, f"[哈希] 错误:路径不存在: {p}")
+                continue
+            try:
+                hashes.append(autov2(sha256_hex(p)))
+            except Exception as e:
+                errors += 1
+                _log(log, f"[哈希] 错误:计算哈希失败 {p}: {e}")
+
+        if not hashes:
+            continue
+        if len(set(hashes)) > 1:
+            errors += 1
+            _log(log, f"[哈希] 错误:记录 {av} 的多个路径哈希不一致,请手动检查。")
+            continue
+
+        real_av = hashes[0]
+        if is_pending_key(av):
+            if real_av in db and real_av != av:
+                target = db[real_av]
+                if not isinstance(target.get("file"), list):
+                    target["file"] = []
+                if not isinstance(target.get("paths"), list):
+                    target["paths"] = []
+
+                # 清理旧记录中已经不存在的路径,并移除对应的旧文件名
+                old_paths = []
+                for old_p in target["paths"]:
+                    if old_p and os.path.exists(old_p):
+                        old_paths.append(old_p)
+                    else:
+                        old_base = os.path.basename(old_p) if old_p else ""
+                        if old_base:
+                            target["file"] = [f for f in target["file"] if f != old_base]
+                target["paths"] = old_paths
+
+                for f in entry.get("file") or []:
+                    if f and f not in target["file"]:
+                        target["file"].append(f)
+                for p in entry.get("paths") or []:
+                    if p and p not in target["paths"]:
+                        target["paths"].append(p)
+                del db[av]
+                _log(log, f"[哈希] 临时记录已合并到 {real_av}")
+            else:
+                db[real_av] = db.pop(av)
+                _log(log, f"[哈希] 临时记录已转为正式 AutoV2: {real_av}")
+            changed = True
+            hashed += 1
+        else:
+            if av != real_av:
+                errors += 1
+                _log(log, f"[哈希] 错误:记录主键 {av} 与文件哈希 {real_av} 不一致。")
+            else:
+                _log(log, f"[哈希] 记录 {av} 哈希校验通过")
+                hashed += 1
+
+        if progress:
+            progress(i, total)
+
+    if changed:
+        save_db(db, db_path)
+    _log(log, f"[哈希] {mode}完成:处理 {hashed} 条,错误 {errors} 条。")
+    return db
+
+
+def query_missing_airs(db_path=None, log=None, cancel=None, progress=None):
+    """新增联网查询:遍历数据库,找到有 AutoV2 但没有 AIR 的记录,联网查询。"""
+    db_path = db_path or default_db_path()
+    db = load_db(db_path)
+    normalize_db(db)
+
+    to_query = []
+    for av, entry in db.items():
+        if is_pending_key(av):
+            _log(log, f"[联网] 跳过待哈希记录: {av}")
+            continue
+        if entry.get("AIR"):
+            continue
+        to_query.append(av)
+
+    _log(log, f"[联网] 当前 {len(db)} 条记录,有 {len(to_query)} 条缺少 AIR。")
+    ok = 0
+    fail = 0
+    for i, av in enumerate(to_query, 1):
+        if cancel and cancel.is_set():
+            _log(log, "[联网] 已取消。")
+            break
+        entry, err = query_by_autov2(av)
+        if entry is None:
+            fail += 1
+            db[av]["failed"] = True
+            db[av]["error"] = err
+            _log(log, f"    [{i}/{len(to_query)}] 失败 {av}: {err}")
+        else:
+            ok += 1
+            old = db[av]
+            entry["file"] = old.get("file") or []
+            entry["paths"] = old.get("paths") or []
+            entry["queriedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            db[av] = entry
+            _log(log, f"    [{i}/{len(to_query)}] OK {av}  {entry['modelName']}")
+        if progress:
+            progress(i, len(to_query))
+
+    save_db(db, db_path)
+    _log(log, f"[联网] 完成:成功 {ok} 条,失败 {fail} 条。")
     return db
 
 
