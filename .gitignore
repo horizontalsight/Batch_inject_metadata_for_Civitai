@@ -6,6 +6,9 @@ __pycache__/
 # 虚拟环境
 .venv/
 
+#备注和备份
+备注/
+
 # 打包产物 (PyInstaller)
 dist/
 build/

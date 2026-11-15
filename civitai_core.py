@@ -918,8 +918,22 @@ def scan_and_register_folder(folder, db_path=None, log=None, cancel=None, progre
                 _log(log, f"[扫描] 已补路径: {norm_p}")
             else:
                 if norm_p not in entry["paths"]:
-                    errors += 1
-                    _log(log, f"[扫描] 错误:同名文件但路径不同,已跳过: {norm_p}")
+                    # 旧路径可能已经失效(文件被移动/删除),此时清除失效路径并补录新路径,
+                    # 避免一直报“同名文件但路径不同”而无法自动恢复。
+                    if any(not os.path.exists(old) for old in entry["paths"]):
+                        entry["paths"] = [old for old in entry["paths"] if os.path.exists(old)]
+                        if norm_p not in entry["paths"]:
+                            entry["paths"].append(norm_p)
+                        if not isinstance(entry.get("file"), list):
+                            entry["file"] = []
+                        real_name = os.path.basename(p)
+                        if real_name not in entry["file"]:
+                            entry["file"].append(_unique_file_name(db, av, real_name))
+                        filled += 1
+                        _log(log, f"[扫描] 旧路径已失效,已补录新路径: {norm_p}")
+                    else:
+                        errors += 1
+                        _log(log, f"[扫描] 错误:同名文件但路径不同,已跳过: {norm_p}")
                 else:
                     _log(log, f"[扫描] 路径已存在: {norm_p}")
             continue
@@ -936,13 +950,19 @@ def scan_and_register_folder(folder, db_path=None, log=None, cancel=None, progre
 
 
 def verify_local_paths(db_path=None, log=None, cancel=None, progress=None):
-    """更新本地位置:从数据库遍历已有 paths,校验文件是否存在、文件名是否匹配。"""
+    """更新本地位置:从数据库遍历已有 paths,校验文件是否存在、文件名是否匹配。
+
+    若某条路径已经失效(文件被移动/删除),会立即从该记录的 paths 中清除,
+    同时保留 file 文件名,这样后续「开始扫描模型」可按文件名自动补录新路径,
+    而不会因为旧路径还在而报“同名文件但路径不同”的错误。
+    """
     db_path = db_path or default_db_path()
     db = load_db(db_path)
     normalize_db(db)
 
     changed = False
     errors = 0
+    cleared = 0
     filled_files = 0
     db_items = list(db.items())
     total = len(db_items)
@@ -955,30 +975,37 @@ def verify_local_paths(db_path=None, log=None, cancel=None, progress=None):
         if not entry.get("paths"):
             errors += 1
             _log(log, f"[本地位置] 错误:记录 {av} ({entry.get('modelName') or ''}) 没有本地路径,请删除或重建。")
-        else:
-            for p in entry.get("paths") or []:
-                if not p:
-                    continue
-                if not os.path.exists(p):
-                    errors += 1
-                    _log(log, f"[本地位置] 错误:路径不存在: {p}")
-                    continue
-                real_name = os.path.basename(p)
-                if not isinstance(entry.get("file"), list):
-                    entry["file"] = []
-                if not entry["file"]:
-                    entry["file"].append(real_name)
-                    filled_files += 1
-                    changed = True
-                elif real_name not in entry["file"]:
-                    errors += 1
-                    _log(log, f"[本地位置] 错误:记录 {av} 的 file 与路径文件名不一致: {p}")
+            continue
+
+        new_paths = []
+        for p in entry.get("paths") or []:
+            if not p:
+                continue
+            if not os.path.exists(p):
+                cleared += 1
+                changed = True
+                _log(log, f"[本地位置] 清除失效路径: {p}")
+                continue
+            new_paths.append(p)
+            real_name = os.path.basename(p)
+            if not isinstance(entry.get("file"), list):
+                entry["file"] = []
+            if not entry["file"]:
+                entry["file"].append(real_name)
+                filled_files += 1
+                changed = True
+            elif real_name not in entry["file"]:
+                errors += 1
+                _log(log, f"[本地位置] 错误:记录 {av} 的 file 与路径文件名不一致: {p}")
+        # 若清除了失效路径,写回新的 paths(保留 file,便于后续扫描按文件名重新匹配)
+        entry["paths"] = new_paths
         if progress:
             progress(i, total)
 
     if changed:
         save_db(db, db_path)
-    _log(log, f"[本地位置] 完成:校验 {len(db)} 条记录,错误 {errors} 条,补文件名 {filled_files} 条。")
+    _log(log, f"[本地位置] 完成:校验 {len(db)} 条记录,错误 {errors} 条,"
+              f"清除失效路径 {cleared} 条,补文件名 {filled_files} 条。")
     return db
 
 
