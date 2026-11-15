@@ -1,3 +1,12 @@
+> **Archived / 已归档（2026-11-15）**
+>
+> This repository is no longer maintained. The main functionality has moved to
+> [horizontalSight-custom-nodes](https://github.com/horizontalsight/horizontalSight-custom-nodes),
+> specifically the `civitai_db/` package and its `/db/` web panel.
+>
+> 本仓库已停止维护；本地模型库、Civitai 查询、PNG AIR 注入、提示词修复等主要功能
+> 已迁移到 [horizontalSight-custom-nodes](https://github.com/horizontalsight/horizontalSight-custom-nodes)
+> 的 `civitai_db/` 子包，面板地址为 `/db/`。
 # Civitai 数据导入助手
 
 > ⚠️ **开发中**:本项目仍处于开发阶段,界面与功能可能会调整,可能存在 Bug,请谨慎使用。
